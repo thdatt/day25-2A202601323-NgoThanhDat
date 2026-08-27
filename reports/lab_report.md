@@ -294,15 +294,24 @@ Chaos scenario `silent_degradation` chứng minh: 20/20 câu "90 ngày" bị ch�
 
 ## 12. Live evaluation với Gemini (bổ trợ, không nằm trong thang điểm)
 
-`semantic_cache.py`, `eval_deepeval.py`, `eval_ragas.py` cần `GOOGLE_API_KEY`. Kết quả chạy thật:
+`semantic_cache.py`, `eval_deepeval.py`, `eval_ragas.py` cần `GOOGLE_API_KEY`. Kết quả chạy **thật** với Gemini:
 
 | Thành phần | Kết quả live | Ghi chú |
 |---|---|---|
 | Semantic cache (Gemini embedding) | cosine = **0.943** giữa 2 câu hỏi đồng nghĩa → HIT; hit_rate 100% | `python semantic_cache.py` |
-| DeepEval `FaithfulnessMetric` (gemini-2.5-flash) | score = **0.0**, Pass SLO = **False** — "output nói 90 ngày trong khi policy là 30 ngày" | khớp với heuristic guardrail |
-| RAGAS `Faithfulness` + `AnswerRelevancy` | chưa lấy được — Gemini **free tier 429** (5 req/phút); `eval_ragas.py` đã vá lỗi import `langchain_community.chat_models.vertexai` (shim) và có retry, chạy lại khi quota reset |
+| DeepEval `FaithfulnessMetric` (gemini-2.5-flash) | score = **0.0**, Pass SLO = **False** — "output nói 90 ngày trong khi policy nói 30 ngày" | khớp heuristic guardrail |
+| RAGAS `Faithfulness` + `AnswerRelevancy` (gemini-3.5-flash-lite) | xem bảng dưới; lưu ở [`reports/ragas_results.json`](ragas_results.json) | `python eval_ragas.py` |
 
-Không có số liệu live nào bị bịa. `run_all.py --live-eval` chạy các bước này với `allow_fail` để một lỗi quota không làm hỏng cả lượt.
+**RAGAS — số liệu live:**
+
+| user_input | faithfulness | answer_relevancy | diễn giải |
+|---|---|---|---|
+| "Thời hạn hoàn tiền của tôi là bao lâu?" (trả lời **90 ngày**, context nói 30) | **0.00** | 0.876 | đúng trọng tâm nhưng **bịa** → faithfulness = 0 → guardrail phải chặn |
+| "Công ty có hỗ trợ giao hàng hỏa tốc không?" (trả lời đúng context) | **1.00** | 0.924 | bám sát context → pass |
+
+→ RAGAS và DeepEval **đồng thuận**: câu hallucination có faithfulness = 0.0, câu grounded có faithfulness = 1.0 — xác nhận thiết kế `QualityGuardrail`.
+
+**Ghi chú kỹ thuật:** `eval_ragas.py` đã vá lỗi `import langchain_community.chat_models.vertexai` (module bị gỡ ở langchain-community 0.4) bằng một shim, và có retry/pacing cho rate limit. Model dùng `gemini-3.5-flash-lite` vì `gemini-2.5-flash` free tier chỉ 20 request/ngày (đặt `RAGAS_MODEL=gemini-2.5-flash` để đổi lại). Không số liệu nào bị bịa. `run_all.py --live-eval` chạy các bước này với `allow_fail` để lỗi quota không làm hỏng cả lượt.
 
 ---
 

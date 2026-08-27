@@ -1,0 +1,12 @@
+[
+  {
+    "user_input": "Thời hạn hoàn tiền của tôi là bao lâu?",
+    "faithfulness": 0.0,
+    "answer_relevancy": 0.8759
+  },
+  {
+    "user_input": "Công ty có hỗ trợ giao hàng hỏa tốc không?",
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.9241
+  }
+]

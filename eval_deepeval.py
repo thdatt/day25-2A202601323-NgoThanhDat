@@ -8,6 +8,11 @@ def main() -> None:
     if not os.getenv("GOOGLE_API_KEY"):
         raise SystemExit("GOOGLE_API_KEY is required. Put it in the environment; never commit the key.")
 
+    import sys
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")  # Windows console safety
+
     from deepeval.metrics import FaithfulnessMetric
     from deepeval.models import GeminiModel
     from deepeval.test_case import LLMTestCase
