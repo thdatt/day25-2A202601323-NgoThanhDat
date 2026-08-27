@@ -19,10 +19,34 @@ DATA = [
 ]
 
 
+def _shim_langchain_vertexai() -> None:
+    """ragas (<=0.4.3) hard-imports ``langchain_community.chat_models.vertexai``,
+    a module removed in langchain-community 0.4. It is only referenced in an
+    ``isinstance`` list we never reach (Gemini is driven through the
+    OpenAI-compatible client below), so a tiny stub lets ``import ragas`` succeed.
+    """
+    import sys
+    import types
+
+    name = "langchain_community.chat_models.vertexai"
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)
+        return
+    except ModuleNotFoundError:
+        pass
+    stub = types.ModuleType(name)
+    stub.ChatVertexAI = type("ChatVertexAI", (), {})  # placeholder, never instantiated
+    sys.modules[name] = stub
+
+
 async def evaluate_samples() -> list[dict[str, float | str]]:
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY is required")
+
+    _shim_langchain_vertexai()
 
     from google import genai
     from openai import AsyncOpenAI

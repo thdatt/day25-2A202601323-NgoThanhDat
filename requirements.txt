@@ -1,7 +1,11 @@
+# Core (offline reliability patterns + tests + chaos/load harness)
 numpy>=1.26
 redis>=5.0
 pytest>=8.0
-# Live evaluation / semantic-cache dependencies:
+fakeredis>=2.20      # in-process Redis for tests / demo (no docker needed)
+hypothesis>=6.0      # property-based fuzzing of the circuit-breaker state machine
+
+# Live evaluation / semantic-cache dependencies (only needed for --live-eval):
 google-genai>=1.0
 deepeval>=2.0
 ragas>=0.3

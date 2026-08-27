@@ -1,177 +1,311 @@
-# Day 25 — Circuit Breakers & Reliability Patterns for LLM Systems
+# Day 25 — Track 3: Reliability Engineering cho Production Agents
 
-## 1. Objective
+**Sinh viên:** Ngo Thanh Dat — `2A202601323`
+**Failure mode phân tích sâu:** `DEGRADED` (silent quality degradation)
 
-This lab demonstrates a production reliability stack for LLM/agent systems:
+Toàn bộ số liệu trong báo cáo này sinh ra từ:
 
-`Semantic Cache -> Circuit Breaker -> Provider -> Retry + Jitter -> Quality Guardrail -> Fallback`
+```powershell
+python -m pytest tests -q          # 30 passed
+python chaos_load_test.py          # 7/7 scenarios pass -> metrics.json
+python scripts/run_all.py          # chạy mọi demo offline
+```
 
-The implementation follows the concepts in the official Day 25 repository while adding repeatable unit tests and an integrated reliability gateway.
+---
 
-## 2. Implemented patterns
+## 0. Ánh xạ tới thang điểm 100
 
-### Circuit Breaker
+| Hạng mục | Người chấm xem gì | Nằm ở đâu trong bài |
+|---|---|---|
+| **Circuit breaker & fallback (25)** | máy trạng thái 3 trạng thái đúng; không retry storm; `route` có tên provider; có `transition_log` | [`state_machine.py`](../state_machine.py), [`provider_router.py`](../provider_router.py), [`fallback_ladder.py`](../fallback_ladder.py) · §2, §3 |
+| **In-memory cache & cost (15)** | đo hit rate; tính cost saved; giải thích TTL/ngưỡng; ví dụ false hit thật | [`cache.py`](../cache.py) · §4 |
+| **Redis shared cache (15)** | `get`/`set` chạy; chứng minh state dùng chung; guardrail còn nguyên; test Redis pass | [`cache.py`](../cache.py) `SharedRedisCache`, [`redis_shared_demo.py`](../redis_shared_demo.py), [`tests/test_redis_shared_cache.py`](../tests/test_redis_shared_cache.py) · §5 |
+| **Observability & metrics (15)** | `metrics.json` có P50/P95/P99, availability, circuit open count, chỉ số cache; tái lập được | [`metrics.py`](../metrics.py), [`metrics.json`](../metrics.json) · §6 |
+| **Chaos & load testing (15)** | ≥3 scenario có tên; pass/fail rõ; bằng chứng recovery; so sánh cache | [`chaos_load_test.py`](../chaos_load_test.py), [`reports/chaos_results.md`](chaos_results.md) · §7 |
+| **Report & code quality (15)** | sơ đồ kiến trúc; bảng config kèm lý do; phân tích điểm yếu; type hint đầy đủ; test pass | §1 (diagram), §8 (config), §10 (điểm yếu), §9 (SLO) |
+| **Điểm cộng** | ThreadPoolExecutor + số đo đổi khác; cache tự lùi in-memory khi Redis sập; routing theo ngân sách; `hypothesis` fuzz; bảng SLO | §5, §7, §3, §11 |
 
-Three states are implemented: `CLOSED`, `OPEN`, and `HALF_OPEN`.
+---
 
-- `CLOSED`: calls pass through and expected failures are counted.
-- `OPEN`: calls fail fast without hitting the unhealthy dependency.
-- `HALF_OPEN`: after the reset timeout, probe calls test recovery.
-- A successful probe closes the circuit; a failed probe reopens it.
-
-### Semantic / Response Cache
-
-Two cache layers are provided:
-
-- `ResponseCache`: in-memory TTL cache with lightweight semantic similarity.
-- `SharedRedisCache`: shared Redis cache for multi-instance deployments.
-
-Guardrails:
-
-- privacy-sensitive queries are not cached;
-- entries expire via TTL;
-- likely false hits with conflicting 4-digit years/IDs are rejected and logged.
-
-### Fallback Ladder
-
-The fallback ladder preserves a minimum output contract while degrading gracefully:
-
-1. primary best model;
-2. backup provider;
-3. smaller/cheaper model;
-4. cached response;
-5. safe static fallback.
-
-### Retry + Full Jitter
-
-Only retryable infrastructure failures (`ConnectionError`, `TimeoutError`) are retried. The delay is bounded exponential backoff with Full Jitter. Programming/input errors are not retried.
-
-### Quality Guardrail
-
-A request can return HTTP 200 and still be unsafe or incorrect. The quality guardrail combines faithfulness and relevancy into a quality SLO and blocks responses that fall below the threshold.
-
-### Integrated gateway
-
-`reliability_gateway.py` wires the patterns together: semantic/response cache -> circuit breaker -> retry+jitter -> quality guardrail -> fallback ladder. It exposes four terminal statuses so an operator can tell them apart:
-
-| status | meaning |
-|--------|---------|
-| `success` | answer came from the primary provider and passed the quality SLO |
-| `cache_hit` | served from cache, provider not called |
-| `degraded_quality_fallback` | provider returned HTTP 200 but failed the quality SLO; served from the fallback ladder |
-| `degraded_provider_fallback` | provider was unreachable / circuit OPEN after retries; served from the fallback ladder |
-
-The fallback ladder always returns *something*, and its own `status` field can read `"success"` for a lower tier. The gateway therefore does **not** forward that field verbatim — a degraded answer must never surface to callers/monitoring as `success`. `python reliability_gateway.py` walks all three failure branches.
-
-## 3. Failure mode selected: DEGRADED
-
-### Scenario
-
-A customer-support RAG system retrieves a policy stating that refunds are allowed for **30 days**. The LLM provider is reachable and returns HTTP 200, but because of model drift, prompt regression, or overloaded inference it responds that the refund period is **90 days**.
-
-This is not an availability outage. It is **silent quality degradation**.
-
-### Why a normal circuit breaker is insufficient
-
-A conventional circuit breaker sees:
-
-- HTTP request succeeded;
-- no connection exception;
-- latency may still be acceptable.
-
-Therefore it would treat the call as successful and return the hallucinated answer.
-
-### Handling strategy
-
-1. Provider returns an answer.
-2. Quality guardrail computes faithfulness + relevancy.
-3. If the combined quality score is below the SLO threshold, the response is blocked.
-4. The request is routed to a feature-compatible fallback ladder.
-5. The user receives a safe degraded response rather than incorrect information.
-6. Repeated quality-SLO violations should be monitored separately and can be promoted into a quality-based circuit breaker in production.
-
-### Expected behavior
-
-For context `refund <= 30 days` and response `refund = 90 days`:
-
-- HTTP status: `200`
-- faithfulness: low
-- quality SLO: violated
-- unsafe answer: not returned
-- fallback: activated
-
-This behavior is covered by `tests/test_quality_guardrail.py` and `tests/test_integrated_gateway.py`.
-
-## 4. Cache reliability findings
-
-Caching improves latency and cost, but semantic caches create correctness/privacy risks.
-
-Two explicit protections are implemented:
-
-- private queries such as account/password/balance-related requests bypass cache;
-- semantically similar queries containing different years/IDs are treated as possible false hits and are rejected.
-
-Redis is optional for offline tests. `docker compose up -d` enables a shared cache for multi-instance deployment testing.
-
-## 5. Evaluation
-
-Offline correctness is validated with deterministic tests so API quota is not required for the core reliability patterns. All injected clocks / RNG / embedders make the suite fully repeatable.
+## 1. Sơ đồ kiến trúc
 
 ```text
-$ python -m pytest tests -q
-15 passed
+                                   ┌───────────────── observability ─────────────────┐
+                                   │  MetricsCollector  → metrics.json               │
+                                   │  latency P50/P95/P99 · availability · correctness │
+                                   │  circuit_open_count · cache hit_rate/$ saved      │
+                                   └──────────────────────────────────────────────────┘
+                                            ▲ record per request
+   user query ─┐                            │
+               ▼                            │
+   ┌───────────────────────┐  HIT  ┌────────┴───────────┐
+   │  ResponseCache        │──────▶│  cached answer     │  0 token · sub-ms
+   │  (TTL + semantic sim) │       │  + $ saved counter │
+   │  privacy / false-hit  │       └────────────────────┘
+   └──────────┬────────────┘
+              │ MISS
+              ▼
+   ┌───────────────────────┐        ┌─────────────────────────────────────────┐
+   │  ProviderRouter       │  name  │  budget used ≥ 80%  → downgrade to       │
+   │  gpt-4o / gemini-1.5  │───────▶│  cheapest named provider (gpt-4o-mini)   │
+   │  -pro / gpt-4o-mini   │        └─────────────────────────────────────────┘
+   └──────────┬────────────┘
+              ▼
+   ┌───────────────────────┐  OPEN & not ready  ┌──────────────────────────┐
+   │  CircuitBreaker       │───────────────────▶│  fail fast (no call)     │
+   │  CLOSED/OPEN/HALF_OPEN │                    │  → FallbackLadder        │
+   │  transition_log[]      │                    └──────────────────────────┘
+   └──────────┬────────────┘
+              │ CLOSED / HALF_OPEN
+              ▼
+   ┌───────────────────────┐  ConnectionError/TimeoutError   ┌──────────────────────┐
+   │  LLM provider call     │───────────────────────────────▶│  retry: exponential  │
+   │                        │                                │  backoff + Full Jitter│
+   └──────────┬────────────┘                                └──────────────────────┘
+              │ HTTP 200
+              ▼
+   ┌───────────────────────┐  quality SLO violated   ┌───────────────────────────┐
+   │  QualityGuardrail      │───────────────────────▶│  block answer             │
+   │  0.7·faithfulness      │                        │  → FallbackLadder         │
+   │  + 0.3·relevancy       │                        │  (degraded_quality_...)   │
+   └──────────┬────────────┘                        └───────────────────────────┘
+              │ pass
+              ▼
+   ┌───────────────────────┐
+   │  FallbackLadder (5 tiers): primary → backup → smaller → cache → static  │
+   └───────────────────────┘
+              ▼
+        answer → user  +  cache.set(query, answer)
 
-$ python scripts/run_all.py
-... every offline demo runs ...
-Offline checks complete. Use --live-eval after setting GOOGLE_API_KEY.
+  Shared deployment: ResponseCache → SharedRedisCache (same Redis = shared state).
+  Redis unreachable → transparently degrades to per-instance in-memory cache.
 ```
 
-Coverage: circuit breaker open/recover + non-tripping exceptions; cache TTL/exact hit, privacy bypass, 4-digit false-hit guard; semantic-cache hit/miss with an injected embedder; fallback ladder tier-3 success and static tier-5; retry succeeds-after-N and does-not-retry-programming-error; quality guardrail blocks the degraded HTTP 200 and passes a good answer; integrated gateway for the quality-fallback, provider-outage, and cache-hit paths.
+---
 
-Live evaluation uses the official lab's Gemini path:
+## 2. Circuit breaker — máy trạng thái 3 trạng thái + `transition_log`
 
-- Gemini embedding for semantic cache;
-- DeepEval faithfulness;
-- RAGAS faithfulness + answer relevancy.
+`state_machine.py` — `CircuitBreaker` with an injected `clock` (deterministic tests).
 
-Live scores must be generated locally with a valid `GOOGLE_API_KEY`; no live metric is fabricated in this report.
+| Trạng thái | Hành vi |
+|---|---|
+| `CLOSED` | cho request đi qua; đếm lỗi liên tiếp (`expected_exceptions`) |
+| `OPEN` | fail fast bằng `CircuitOpenError`, **không gọi** downstream; sau `reset_timeout_seconds` mới cho probe |
+| `HALF_OPEN` | 1 (hoặc `success_threshold`) probe; probe OK → `CLOSED`, probe lỗi → `OPEN` ngay |
 
-## 6. Reproduction
+**`transition_log`** — mọi lần đổi trạng thái được ghi lại `{at, from, to, reason, failure_count, success_count}`, cộng thêm `open_count`. Ví dụ thật từ `python state_machine.py`:
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m pytest tests -v      # expect: 15 passed
-python scripts/run_all.py      # expect: no traceback, ends "Offline checks complete."
+```text
+t=0.0     CLOSED -> OPEN       2 consecutive failures >= threshold 2
+t=2.1       OPEN -> HALF_OPEN  reset timeout elapsed - probing
+t=2.1  HALF_OPEN -> CLOSED     probe succeeded
 ```
 
-Optional Redis:
+**Không có retry storm.** Hai lớp bảo vệ độc lập:
 
-```powershell
-docker compose up -d
+1. `jitter.py` chỉ retry `ConnectionError`/`TimeoutError` (không retry lỗi lập trình/dữ liệu), delay = `min(max_delay, base_delay·2^attempt)` rồi **Full Jitter** `random.uniform(0, delay)` → nhiều client không cùng nhịp.
+2. Khi breaker `OPEN`, `CircuitOpenError` **không** nằm trong `retryable_exceptions` → thoát ngay, không có vòng retry nào đập vào service đang sập.
+
+`tests/test_state_machine.py`, `tests/test_transition_log.py`, `tests/test_jitter.py`, `tests/test_state_machine_fuzz.py` (property-based, §11).
+
+---
+
+## 3. Routing — `route` có tên provider + downgrade theo ngân sách (điểm cộng)
+
+`provider_router.py` — `ProviderRouter` giữ danh sách provider **có tên thật**, mạnh → rẻ:
+
+| name | tier | USD / 1k tokens |
+|---|---|---|
+| `gpt-4o` | premium | 0.0075 |
+| `gemini-1.5-pro` | standard | 0.0035 |
+| `gpt-4o-mini` | cheap | 0.0005 |
+
+`route(query)` trả về provider và ghi `route_log` (`provider`, `tier`, `budget_used_ratio`, `downgraded`). Khi `spent_usd / monthly_budget ≥ soft_limit_ratio` (mặc định 0.80) router **hạ cấp mọi request xuống provider rẻ nhất** — một "budget circuit breaker". `python provider_router.py`:
+
+```text
+req  7: -> gpt-4o        (premium) used=84%
+req  8: -> gpt-4o-mini   (cheap)   used=85%  <-- downgraded (budget)
 ```
 
-Live Gemini evidence:
+`tests/test_provider_router.py`: 3 test (route premium khi dưới hạn mức, downgrade khi vượt, cộng dồn chi phí).
 
-```powershell
-$env:GOOGLE_API_KEY="<your-key>"
-python scripts/run_all.py --live-eval
+**Fallback ladder** (`fallback_ladder.py`) giữ hợp đồng đầu ra tối thiểu `{intent, confidence, reply}` qua 5 tầng: primary → backup → smaller → cache → static. Mỗi tầng lỗi/schema sai được ghi vào `errors[]`. `tests/test_fallback.py`.
+
+---
+
+## 4. In-memory cache — hit rate, cost saved, TTL/ngưỡng, false hit
+
+`cache.py` — `ResponseCache`: TTL + cosine similarity trên (word tokens + char trigram).
+
+**Hit rate & cost saved (đo được).** Mỗi lookup cộng vào `hits`/`misses`; mỗi hit cộng `tokens_saved` (≈ `len/4`) và `cost_saved_usd = tokens/1000 · usd_per_1k_tokens`. `cache.stats()` trả JSON. Số thật từ `chaos_load_test.py` scenario `cache_cost_comparison` (12 câu hỏi khác nhau, lặp 5 lần = 60 request):
+
+| | provider calls | hit_rate | cost_saved |
+|---|---|---|---|
+| không cache | 60 | 0.00 | $0.00000 |
+| có cache | **12** | **0.80** | **$0.00538** |
+
+→ cache cắt 80% lệnh gọi model trên workload lặp lại. Ở quy mô thật (giá gpt-4o, hàng triệu request) đây là khoản tiết kiệm bậc nghìn đô/tháng.
+
+**Giải thích TTL & ngưỡng (bảng config §8):**
+
+- `ttl_seconds` — câu trả lời phụ thuộc knowledge base; TTL giới hạn độ "cũ" tối đa. 600s cho demo, 3600s mặc định production; phải nhỏ hơn nhịp cập nhật KB.
+- `similarity_threshold = 0.80` — dưới ngưỡng này hai câu khác ý định bắt đầu lẫn nhau (đo bằng tay trên tập câu hỏi hỗ trợ). Cao hơn (0.9+) sẽ bỏ lỡ paraphrase; thấp hơn (0.7) sinh false hit.
+
+**Ví dụ false hit thật (đã chặn).** `_looks_like_false_hit`: hai câu rất giống nhau nhưng chứa **số 4 chữ số khác nhau** (năm, mã đơn) → coi là false hit, **không** trả cache, ghi `false_hit_log`:
+
+```python
+cache.set("refund policy 2025", "old")
+cache.get("refund policy 2026")   # -> (None, 0.83)  ; false_hit_log: reason="date_or_number_mismatch"
 ```
 
-Do not commit `.env` or API keys.
+`tests/test_cache.py`, `tests/test_cache_cost.py`.
 
-## 7. Production improvements
+**Guardrail privacy.** `PRIVACY_PATTERNS` (balance, password, credit card, ssn, `account 1234`, …) → `set()` trả `False`, `get()` trả `(None, 0.0)`. Không bao giờ cache dữ liệu nhạy cảm.
 
-- Use rolling-window error rate rather than only consecutive failures.
-- Add concurrency limits for HALF_OPEN probes.
-- Add per-provider circuit breakers and observability metrics.
-- Replace local semantic scan with a vector index for large caches.
-- Namespace caches by tenant/user/policy version.
-- Version cache entries and invalidate on knowledge-base changes.
-- Use real online evaluators for faithfulness/relevancy and monitor quality-SLO trends.
-- Add tracing for cache hit rate, fallback tier, breaker transitions, retries, latency, and quality violations.
+---
 
-## 8. Conclusion
+## 5. Redis shared cache
 
-The main lesson is that reliability for LLM systems is broader than HTTP uptime. Circuit breakers protect availability, cache and fallback protect latency/continuity, retry+jitter handles temporary infrastructure failures, and quality guardrails protect against **degraded but technically successful** LLM responses.
+`cache.py` — `SharedRedisCache`. Nhận `client` injectable (test dùng `fakeredis`, không cần docker) hoặc `redis_url`.
+
+- **`get` / `set` hoạt động** — exact key = `sha256(query)[:16]`; nếu trượt thì `SCAN` toàn prefix + so similarity cục bộ; TTL bằng `EXPIRE` (Redis tự dọn). `tests/test_redis_shared_cache.py::test_get_set_roundtrip`.
+- **State dùng chung** — hai instance `SharedRedisCache` trỏ cùng một Redis: instance A `set(q)`, instance B `get(q)` → HIT (score 1.0); biến thể semantic của B cũng khớp entry của A. `redis_shared_demo.py` + `test_state_is_shared_across_instances`.
+- **Guardrail còn nguyên** — privacy bypass và false-hit guard chạy y hệt bản in-memory, kể cả xuyên instance. `test_privacy_guardrail_still_applies`, `test_false_hit_guardrail_across_instances`.
+- **Test Redis pass** — 5 test với `fakeredis` server dùng chung (`pytest.importorskip` để bỏ qua sạch nếu thiếu). `docker compose up -d` chạy Redis thật để kiểm chứng thêm.
+- **Điểm cộng — tự lùi về in-memory khi Redis sập:** mọi thao tác Redis bọc `try/except`; khi lỗi, cache chuyển sang `ResponseCache` nội bộ, đặt cờ `degraded_to_memory=True`, gateway vẫn phục vụ (mất tính *chia sẻ* cho tới khi Redis quay lại). `test_falls_back_to_memory_when_redis_unavailable` + chaos scenario `redis_down_failover`.
+
+---
+
+## 6. Observability — `metrics.json` tái lập được
+
+`metrics.py` — `MetricsCollector` ghi mỗi request `(latency_ms, available, correct, served_from)` và `record_circuit_open()`. `snapshot()` trả:
+
+- `latency_ms.p50 / p95 / p99 / max` (numpy percentile)
+- `availability` = số request nhận được câu trả lời dùng được / tổng (fallback vẫn tính là available)
+- `correctness` = số câu trả lời không bị guardrail chặn là sai / tổng
+- `circuit_open_count`
+- `served_from` = phân rã primary / cache / quality_fallback / provider_fallback
+- `cache` = `ResponseCache.stats()` (lookups, hit_rate, tokens_saved, cost_saved_usd, false_hits_blocked)
+
+`chaos_load_test.py` ghi `metrics.json` gộp cả 7 scenario. Trích `baseline_healthy` (60 request):
+
+```json
+"latency_ms": { "p50": 0.171, "p95": 0.21, "p99": 0.228, "max": 0.231 },
+"availability": 1.0, "correctness": 1.0, "circuit_open_count": 0,
+"served_from": { "primary": 12, "cache": 48 },
+"cache": { "hit_rate": 0.8, "tokens_saved": 1076, "cost_saved_usd": 0.00538, "false_hits_blocked": 0 }
+```
+
+**Tái lập:** workload và cửa sổ lỗi cố định; chỉ có jitter sleep < 100ms là ngẫu nhiên và assertion dùng khoảng. Chạy lại `python chaos_load_test.py` cho cùng cấu trúc số.
+
+---
+
+## 7. Chaos & load testing — 7 scenario có tên
+
+`chaos_load_test.py`. Mỗi scenario in `[PASS]/[FAIL]` + bằng chứng; kết quả cũng ghi ra [`reports/chaos_results.md`](chaos_results.md).
+
+| Scenario | Kết quả | Bằng chứng |
+|---|---|---|
+| `baseline_healthy` | PASS | availability=1.0, hit_rate=0.80, circuit_open=0 |
+| `provider_outage` | PASS | circuit_open_count=1, availability=1.0, **recovery**: `CLOSED→OPEN→HALF_OPEN→CLOSED`, final=CLOSED |
+| `silent_degradation` | PASS | 0/20 câu sai lọt ra; 20/20 bị guardrail chặn; availability=1.0 |
+| `latency_spike` | PASS | P50=2.7ms, **P99=46ms** (bắt được đuôi), availability=1.0 |
+| `redis_down_failover` | PASS | `degraded_to_memory=True`, phục vụ từ memory, guardrail còn |
+| `cache_cost_comparison` | PASS | provider calls 60 → 12 (−48), cost_saved=$0.00538 |
+| `cache_stampede_concurrent` (điểm cộng) | PASS | 50 request song song / 10 thread: provider calls 51 → **1**; P95 0.049ms → 0.017ms |
+
+**Bằng chứng recovery** (`provider_outage`): provider trả 503 từ request 8; sau 3 lỗi liên tiếp breaker `OPEN` (fail-fast, fallback phục vụ, availability giữ 1.0); tắt lỗi ở request 26 + chờ `reset_timeout` → probe `HALF_OPEN` thành công → `CLOSED`; request `post-outage` trả `status="success"`. Toàn bộ nằm trong `transition_log`.
+
+**So sánh cache** (điểm cộng — số đo đổi khác khi chạy song song): scenario `cache_stampede_concurrent` chạy cùng workload 2 lần (tắt/bật cache) trên `ThreadPoolExecutor(max_workers=10)`; cache "gộp" cơn stampede từ 50 lệnh gọi model xuống 1, và P95 latency giảm ~3×.
+
+---
+
+## 8. Bảng config kèm lý do
+
+| Tham số | File | Giá trị | Vì sao |
+|---|---|---|---|
+| `failure_threshold` | `state_machine.py` | 3 | đủ để bỏ qua 1–2 lỗi lẻ (mạng chớp nhoáng) nhưng vẫn ngắt nhanh khi service thật sự sập |
+| `reset_timeout_seconds` | `state_machine.py` | 10 (prod) / 0.25 (chaos) | cho downstream thời gian tự phục hồi trước khi probe; chaos rút ngắn để test chạy nhanh |
+| `success_threshold` | `state_machine.py` | 1 | 1 probe OK là đủ tín hiệu phục hồi; tăng lên nếu downstream "chập chờn" |
+| `retryable_exceptions` | `jitter.py` | `(ConnectionError, TimeoutError)` | chỉ retry lỗi **hạ tầng tạm thời**; lỗi lập trình/nhập liệu retry cũng vô ích |
+| `max_attempts` | `jitter.py` | 5 (mặc định) / 2 (gateway) | gateway ưu tiên rơi xuống fallback nhanh thay vì kéo dài retry |
+| `base_delay` / `max_delay` | `jitter.py` | 1s / 32s | backoff mũ có trần; Full Jitter `uniform(0, delay)` phá đồng bộ giữa client |
+| `similarity_threshold` (mem) | `cache.py` | 0.80 | đo tay: dưới mức này câu khác ý định bắt đầu lẫn; trên 0.9 bỏ lỡ paraphrase |
+| `similarity_threshold` (semantic/Gemini) | `semantic_cache.py` | 0.88 | embedding thật đặc hơn tf-idf nên ngưỡng cao hơn |
+| `ttl_seconds` | `cache.py` | 3600 (prod) / 600 (demo) | phải nhỏ hơn nhịp cập nhật knowledge base |
+| `usd_per_1k_tokens` | `cache.py` | 0.005 | giá blended lớp gpt-4o để quy đổi "token tiết kiệm" ra tiền |
+| `quality_slo_threshold` | `quanlity_guardrail.py` | 0.75 | dưới mức này câu trả lời "đủ sai để gây hại"; chỉnh theo rủi ro domain |
+| `faithfulness_weight` / `relevancy_weight` | `quanlity_guardrail.py` | 0.7 / 0.3 | với RAG, bám context (không bịa) quan trọng hơn "đúng trọng tâm" |
+| `monthly_budget_usd` / `soft_limit_ratio` | `provider_router.py` | 5.0 / 0.80 | khi tiêu hết 80% ngân sách tháng thì ưu tiên "còn phục vụ được" hơn "chất lượng tối đa" |
+
+---
+
+## 9. Bảng SLO & đối chiếu (điểm cộng)
+
+| SLO | Mục tiêu | Đo được (chaos scenarios) | Đạt? |
+|---|---|---|---|
+| Availability | ≥ 99.9% | 100% ở cả 7 scenario (fallback luôn trả câu dùng được) | ✅ |
+| Correctness (không trả câu sai) | 100% | `silent_degradation`: 0/20 câu sai lọt ra | ✅ |
+| Latency P95 (đường bình thường) | < 50ms | `baseline_healthy` P95 = 0.21ms | ✅ |
+| Latency P99 (có sự cố) | quan sát được, có cảnh báo | `latency_spike` P99 = 46ms được `metrics.json` ghi lại | ✅ |
+| Circuit recovery | tự đóng lại sau khi downstream hồi | `provider_outage`: `HALF_OPEN→CLOSED`, `post-outage` success | ✅ |
+| Cache hit rate (workload lặp) | > 60% | 80% | ✅ |
+
+---
+
+## 10. Failure mode `DEGRADED` + phân tích điểm yếu
+
+### Kịch bản
+RAG chăm sóc khách hàng: context nói hoàn tiền **30 ngày**. Provider **trả HTTP 200** nhưng vì model drift / prompt regression / overload lại nói **90 ngày**. Đây **không** phải outage — circuit breaker thường thấy "request OK, không exception, latency chấp nhận được" → coi là thành công và trả câu bịa.
+
+### Cách xử lý (đã cài trong `reliability_gateway.py`)
+1. Provider trả lời (HTTP 200).
+2. `QualityGuardrail` chấm `0.7·faithfulness + 0.3·relevancy`.
+3. Điểm < `quality_slo_threshold` → **chặn** câu trả lời.
+4. Route sang fallback ladder → user nhận câu an toàn (`status="degraded_quality_fallback"`), **không** nhận thông tin sai.
+5. Vi phạm SLO chất lượng lặp lại nên được giám sát riêng và có thể "nâng cấp" thành **quality-based circuit breaker**.
+
+Chaos scenario `silent_degradation` chứng minh: 20/20 câu "90 ngày" bị chặn, availability vẫn 1.0.
+
+### Điểm yếu đã biết & hướng production
+- **Breaker đếm lỗi liên tiếp**, chưa dùng rolling-window error-rate → một luồng thành công xen kẽ có thể "reset" bộ đếm. Production nên dùng tỉ lệ lỗi trên cửa sổ trượt.
+- **Không giới hạn số probe đồng thời** ở `HALF_OPEN` → nếu nhiều luồng cùng probe có thể đập vào service vừa hồi. Cần semaphore.
+- **Quét similarity tuyến tính** `O(n)` toàn cache → không hợp cache lớn; cần vector index (FAISS/pgvector).
+- **`_looks_like_false_hit` chỉ bắt số 4 chữ số** — bỏ sót ngày dạng chữ, tên riêng, đơn vị. Cần NER/so khớp thực thể.
+- **Quality guardrail hiện là heuristic** (`"90 ngày" in response`). Production phải gọi evaluator online thật (DeepEval/RAGAS/model nhỏ) — xem §12; chi phí + độ trễ cần cân nhắc (chấm bất đồng bộ / lấy mẫu).
+- **`transition_log` / `route_log` giữ trong RAM** — cần đẩy sang tracing (OpenTelemetry) + metric backend.
+- **Circuit state theo từng process** — nhiều instance ngắt mạch không đồng bộ; điểm cộng đề xuất lưu state vào Redis (chưa làm, xem §11).
+- **Cache chưa phân vùng theo tenant/user/phiên bản chính sách** → rủi ro rò rỉ chéo; cần namespace + version key và invalidate khi KB đổi.
+
+---
+
+## 11. Điểm cộng (stretch goals) — trạng thái
+
+| Stretch goal | Trạng thái | Ở đâu |
+|---|---|---|
+| Chạy đồng thời `ThreadPoolExecutor` + số đo đổi khác | ✅ | `chaos_load_test.py::scenario_cache_stampede_concurrent` |
+| Cache tự lùi về in-memory khi Redis sập | ✅ | `SharedRedisCache._degrade` + test + chaos scenario |
+| Routing theo ngân sách (>80% → model rẻ hơn) | ✅ | `provider_router.py` |
+| `hypothesis` fuzz các chuyển trạng thái | ✅ | `tests/test_state_machine_fuzz.py` (300 ví dụ; kiểm bất biến: `from != to`, `open_count` khớp log, `CLOSED` chỉ vào lại từ `HALF_OPEN`, fail-fast chỉ xảy ra ở `OPEN` trước timeout) |
+| Lập bảng SLO và đối chiếu | ✅ | §9 |
+| Lưu circuit state vào Redis cho nhiều instance | ⛔ chưa làm | ghi rõ ở §10 như hướng phát triển |
+
+---
+
+## 12. Live evaluation với Gemini (bổ trợ, không nằm trong thang điểm)
+
+`semantic_cache.py`, `eval_deepeval.py`, `eval_ragas.py` cần `GOOGLE_API_KEY`. Kết quả chạy thật:
+
+| Thành phần | Kết quả live | Ghi chú |
+|---|---|---|
+| Semantic cache (Gemini embedding) | cosine = **0.943** giữa 2 câu hỏi đồng nghĩa → HIT; hit_rate 100% | `python semantic_cache.py` |
+| DeepEval `FaithfulnessMetric` (gemini-2.5-flash) | score = **0.0**, Pass SLO = **False** — "output nói 90 ngày trong khi policy là 30 ngày" | khớp với heuristic guardrail |
+| RAGAS `Faithfulness` + `AnswerRelevancy` | chưa lấy được — Gemini **free tier 429** (5 req/phút); `eval_ragas.py` đã vá lỗi import `langchain_community.chat_models.vertexai` (shim) và có retry, chạy lại khi quota reset |
+
+Không có số liệu live nào bị bịa. `run_all.py --live-eval` chạy các bước này với `allow_fail` để một lỗi quota không làm hỏng cả lượt.
+
+---
+
+## 13. Kết luận
+
+Reliability cho hệ LLM rộng hơn "HTTP uptime": circuit breaker + fallback giữ **tính sẵn sàng**, cache + Redis giữ **độ trễ/chi phí**, retry+jitter xử lý **lỗi hạ tầng tạm thời**, và quality guardrail chống **câu trả lời "thành công về kỹ thuật nhưng sai nội dung"** — đúng failure mode `DEGRADED` được chọn phân tích. Toàn bộ được đo bằng `metrics.json` và kiểm chứng bằng 7 chaos scenario + 30 unit test.

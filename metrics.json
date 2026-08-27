@@ -1,0 +1,152 @@
+{
+  "summary": {
+    "scenarios_total": 7,
+    "scenarios_passed": 7
+  },
+  "scenarios": [
+    {
+      "name": "baseline_healthy",
+      "passed": true,
+      "detail": "availability=1.0, hit_rate=0.80, provider_calls=12/60, circuit_open=0",
+      "metrics": {
+        "scenario": "baseline_healthy",
+        "requests": 60,
+        "latency_ms": {
+          "p50": 0.174,
+          "p95": 0.219,
+          "p99": 0.229,
+          "max": 0.231
+        },
+        "availability": 1.0,
+        "correctness": 1.0,
+        "circuit_open_count": 0,
+        "served_from": {
+          "primary": 12,
+          "cache": 48
+        },
+        "cache": {
+          "lookups": 60,
+          "hits": 48,
+          "misses": 12,
+          "hit_rate": 0.8,
+          "tokens_saved": 1076,
+          "cost_saved_usd": 0.00538,
+          "entries": 12,
+          "false_hits_blocked": 0
+        }
+      }
+    },
+    {
+      "name": "provider_outage",
+      "passed": true,
+      "detail": "circuit_open_count=1, availability=1.0, final_state=CLOSED, transitions=['CLOSED->OPEN', 'OPEN->HALF_OPEN', 'HALF_OPEN->CLOSED']",
+      "metrics": {
+        "scenario": "provider_outage",
+        "requests": 40,
+        "latency_ms": {
+          "p50": 0.084,
+          "p95": 0.524,
+          "p99": 24.45,
+          "max": 35.585
+        },
+        "availability": 1.0,
+        "correctness": 1.0,
+        "circuit_open_count": 1,
+        "served_from": {
+          "primary": 22,
+          "provider_fallback": 18
+        },
+        "cache": {}
+      }
+    },
+    {
+      "name": "silent_degradation",
+      "passed": true,
+      "detail": "wrong_answers_delivered=0/20, blocked_by_guardrail=20/20, availability=1.0",
+      "metrics": {
+        "scenario": "silent_degradation",
+        "requests": 20,
+        "latency_ms": {
+          "p50": 0.007,
+          "p95": 0.013,
+          "p99": 0.023,
+          "max": 0.025
+        },
+        "availability": 1.0,
+        "correctness": 1.0,
+        "circuit_open_count": 0,
+        "served_from": {
+          "quality_fallback": 20
+        },
+        "cache": {}
+      }
+    },
+    {
+      "name": "latency_spike",
+      "passed": true,
+      "detail": "p50=2.705ms p95=45.846ms p99=46.052ms (tail captured), availability=1.0",
+      "metrics": {
+        "scenario": "latency_spike",
+        "requests": 40,
+        "latency_ms": {
+          "p50": 2.705,
+          "p95": 45.846,
+          "p99": 46.052,
+          "max": 46.058
+        },
+        "availability": 1.0,
+        "correctness": 1.0,
+        "circuit_open_count": 0,
+        "served_from": {
+          "primary": 40
+        },
+        "cache": {}
+      }
+    },
+    {
+      "name": "redis_down_failover",
+      "passed": true,
+      "detail": "degraded_to_memory=True, served_from_memory=True, privacy_guardrail_intact=True",
+      "metrics": {
+        "scenario": "redis_down_failover",
+        "degraded_to_memory": true
+      }
+    },
+    {
+      "name": "cache_cost_comparison",
+      "passed": true,
+      "detail": "provider_calls 60 -> 12 (-48), hit_rate=0.8, cost_saved=$0.00538",
+      "metrics": {
+        "scenario": "cache_cost_comparison",
+        "no_cache": {
+          "provider_calls": 60,
+          "hit_rate": 0.0,
+          "cost_saved_usd": 0.0
+        },
+        "with_cache": {
+          "provider_calls": 12,
+          "hit_rate": 0.8,
+          "cost_saved_usd": 0.00538
+        }
+      }
+    },
+    {
+      "name": "cache_stampede_concurrent",
+      "passed": true,
+      "detail": "provider_calls no_cache=51 vs with_cache=1 (saved $0.00625); p95 no_cache=0.051ms vs with_cache=0.016ms",
+      "metrics": {
+        "scenario": "cache_stampede_concurrent",
+        "no_cache": {
+          "provider_calls": 51,
+          "cost_saved_usd": 0.0,
+          "p95_ms": 0.051
+        },
+        "with_cache": {
+          "provider_calls": 1,
+          "cost_saved_usd": 0.00625,
+          "p95_ms": 0.016
+        }
+      }
+    }
+  ]
+}

@@ -44,10 +44,26 @@ class CircuitBreaker:
         self.failure_count = 0
         self.success_count = 0
         self.last_state_change = self._clock()
+        # Audit trail of every state change, for observability and grading.
+        self.transition_log: list[dict[str, Any]] = []
+        self.open_count = 0
 
-    def _transition(self, state: CircuitState) -> None:
+    def _transition(self, state: CircuitState, reason: str = "") -> None:
+        previous = self.state
         self.state = state
         self.last_state_change = self._clock()
+        if state == CircuitState.OPEN:
+            self.open_count += 1
+        self.transition_log.append(
+            {
+                "at": self.last_state_change,
+                "from": previous.value,
+                "to": state.value,
+                "reason": reason,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+            }
+        )
 
     def _ready_to_probe(self) -> bool:
         return (self._clock() - self.last_state_change) >= self.reset_timeout_seconds
@@ -58,7 +74,7 @@ class CircuitBreaker:
             if self.success_count >= self.success_threshold:
                 self.failure_count = 0
                 self.success_count = 0
-                self._transition(CircuitState.CLOSED)
+                self._transition(CircuitState.CLOSED, "probe succeeded")
         elif self.state == CircuitState.CLOSED:
             self.failure_count = 0
 
@@ -66,16 +82,19 @@ class CircuitBreaker:
         self.failure_count += 1
         if self.state == CircuitState.HALF_OPEN:
             self.success_count = 0
-            self._transition(CircuitState.OPEN)
+            self._transition(CircuitState.OPEN, "probe failed")
         elif self.state == CircuitState.CLOSED and self.failure_count >= self.failure_threshold:
-            self._transition(CircuitState.OPEN)
+            self._transition(
+                CircuitState.OPEN,
+                f"{self.failure_count} consecutive failures >= threshold {self.failure_threshold}",
+            )
 
     def call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if self.state == CircuitState.OPEN:
             if not self._ready_to_probe():
                 raise CircuitOpenError("Circuit is OPEN - fail fast")
             self.success_count = 0
-            self._transition(CircuitState.HALF_OPEN)
+            self._transition(CircuitState.HALF_OPEN, "reset timeout elapsed - probing")
 
         try:
             result = fn(*args, **kwargs)
@@ -123,7 +142,11 @@ def demo() -> None:
     now[0] += 2.1
     down[0] = False
     print(breaker.call(provider, "recovery probe"))
-    print(f"recovered state={breaker.state}")
+    print(f"recovered state={breaker.state}; open_count={breaker.open_count}")
+
+    print("\ntransition_log:")
+    for entry in breaker.transition_log:
+        print(f"  t={entry['at']:.1f}  {entry['from']:>9} -> {entry['to']:<9}  {entry['reason']}")
 
 
 if __name__ == "__main__":

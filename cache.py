@@ -16,6 +16,15 @@ PRIVACY_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Blended input+output price of the model a cache hit *avoids* calling.
+# GPT-4o-class pricing, rounded: ~$0.005 / 1k tokens.
+USD_PER_1K_TOKENS = 0.005
+
+
+def _est_tokens(text: str) -> int:
+    """Rough token count (~4 chars/token) - enough for cost accounting."""
+    return max(1, len(text) // 4)
+
 
 def _is_uncacheable(query: str) -> bool:
     return bool(PRIVACY_PATTERNS.search(query))
@@ -44,12 +53,19 @@ class ResponseCache:
         ttl_seconds: int = 3600,
         similarity_threshold: float = 0.75,
         clock: Callable[[], float] = time.monotonic,
+        usd_per_1k_tokens: float = USD_PER_1K_TOKENS,
     ) -> None:
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self._clock = clock
+        self.usd_per_1k_tokens = usd_per_1k_tokens
         self._entries: list[CacheEntry] = []
         self.false_hit_log: list[dict[str, object]] = []
+        # Cost / hit-rate accounting.
+        self.hits = 0
+        self.misses = 0
+        self.tokens_saved = 0
+        self.cost_saved_usd = 0.0
 
     def get(self, query: str) -> tuple[str | None, float]:
         if _is_uncacheable(query):
@@ -70,6 +86,7 @@ class ResponseCache:
                 best_entry = entry
 
         if best_entry is None or best_score < self.similarity_threshold:
+            self.misses += 1
             return None, best_score
 
         if _looks_like_false_hit(query, best_entry.key):
@@ -81,9 +98,31 @@ class ResponseCache:
                     "reason": "date_or_number_mismatch",
                 }
             )
+            self.misses += 1
             return None, best_score
 
+        self.hits += 1
+        saved = _est_tokens(query) + _est_tokens(best_entry.value)
+        self.tokens_saved += saved
+        self.cost_saved_usd += saved / 1000.0 * self.usd_per_1k_tokens
         return best_entry.value, best_score
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total else 0.0
+
+    def stats(self) -> dict[str, float | int]:
+        return {
+            "lookups": self.hits + self.misses,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(self.hit_rate, 4),
+            "tokens_saved": self.tokens_saved,
+            "cost_saved_usd": round(self.cost_saved_usd, 6),
+            "entries": len(self._entries),
+            "false_hits_blocked": len(self.false_hit_log),
+        }
 
     def set(
         self,
@@ -132,7 +171,16 @@ class ResponseCache:
 
 
 class SharedRedisCache:
-    """Redis-backed cache shared by multiple gateway instances."""
+    """Redis-backed cache shared by multiple gateway instances.
+
+    When every instance points at the same Redis, a cache entry written by one
+    instance is immediately visible to the others (proved in
+    `tests/test_redis_shared_cache.py` and `redis_shared_demo.py`).
+
+    If Redis is unreachable and ``memory_fallback`` is set, the cache degrades to
+    a per-instance in-memory `ResponseCache` instead of raising - the gateway
+    keeps serving, it just loses the *shared* property until Redis returns.
+    """
 
     def __init__(
         self,
@@ -140,16 +188,34 @@ class SharedRedisCache:
         ttl_seconds: int = 3600,
         similarity_threshold: float = 0.75,
         prefix: str = "rl:cache:",
+        *,
+        client: Any | None = None,
+        memory_fallback: bool = True,
     ) -> None:
-        try:
-            import redis as redis_lib
-        except ImportError as exc:  # pragma: no cover - environment dependent
-            raise RuntimeError("Install redis: python -m pip install redis") from exc
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self.prefix = prefix
         self.false_hit_log: list[dict[str, object]] = []
-        self._redis: Any = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        self.degraded_to_memory = False
+        self._mem = (
+            ResponseCache(ttl_seconds=ttl_seconds, similarity_threshold=similarity_threshold)
+            if memory_fallback
+            else None
+        )
+        if client is not None:
+            self._redis: Any = client
+        else:
+            try:
+                import redis as redis_lib
+            except ImportError as exc:  # pragma: no cover - environment dependent
+                raise RuntimeError("Install redis: python -m pip install redis") from exc
+            self._redis = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+
+    def _degrade(self) -> ResponseCache:
+        if self._mem is None:
+            raise
+        self.degraded_to_memory = True
+        return self._mem
 
     def ping(self) -> bool:
         try:
@@ -160,7 +226,12 @@ class SharedRedisCache:
     def get(self, query: str) -> tuple[str | None, float]:
         if _is_uncacheable(query):
             return None, 0.0
+        try:
+            return self._get_redis(query)
+        except Exception:
+            return self._degrade().get(query)
 
+    def _get_redis(self, query: str) -> tuple[str | None, float]:
         exact_key = f"{self.prefix}{self._query_hash(query)}"
         exact = self._redis.hget(exact_key, "response")
         if exact is not None:
@@ -202,21 +273,34 @@ class SharedRedisCache:
     ) -> bool:
         if _is_uncacheable(query):
             return False
-        key = f"{self.prefix}{self._query_hash(query)}"
-        mapping: dict[str, str] = {"query": query, "response": value}
-        for meta_key, meta_value in (metadata or {}).items():
-            mapping[f"meta:{meta_key}"] = meta_value
-        self._redis.hset(key, mapping=mapping)
-        self._redis.expire(key, self.ttl_seconds)
-        return True
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            mapping: dict[str, str] = {"query": query, "response": value}
+            for meta_key, meta_value in (metadata or {}).items():
+                mapping[f"meta:{meta_key}"] = meta_value
+            self._redis.hset(key, mapping=mapping)
+            self._redis.expire(key, self.ttl_seconds)
+            return True
+        except Exception:
+            return self._degrade().set(query, value, metadata)
 
     def flush(self) -> None:
-        keys = list(self._redis.scan_iter(f"{self.prefix}*"))
-        if keys:
-            self._redis.delete(*keys)
+        try:
+            keys = list(self._redis.scan_iter(f"{self.prefix}*"))
+            if keys:
+                self._redis.delete(*keys)
+        except Exception:
+            pass
+        if self._mem is not None:
+            self._mem = ResponseCache(
+                ttl_seconds=self.ttl_seconds, similarity_threshold=self.similarity_threshold
+            )
 
     def close(self) -> None:
-        self._redis.close()
+        try:
+            self._redis.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _query_hash(query: str) -> str:
