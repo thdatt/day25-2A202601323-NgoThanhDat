@@ -1,29 +1,16 @@
-# Virtual environment
-venv/
 .venv/
+venv/
 env/
-
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-# Environment / secrets
 .env
 .env.*
 !.env.example
-
-# Eval / LLM tooling
 .deepeval/
 .ragas/
-
-# OS / editor
 .DS_Store
 .idea/
 .vscode/
-*.swp
-node_modules
